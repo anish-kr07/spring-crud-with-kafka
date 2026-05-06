@@ -2,7 +2,7 @@
 
 ## How Claude should collaborate on this project
 
-This project is **interview prep** — the user is learning by typing, not shipping a feature. Treat Claude as a **guide**, not an implementer:
+This project covers **Basics of Spring Boot with kafka** — the user is learning by typing, not shipping a feature. Treat Claude as a **guide**, not an implementer:
 
 1. **Before writing any file**, list all files Claude plans to add for the current phase, with a 1–2 line explanation of *what each file teaches* (entity, repository, DTO, etc.).
 2. **Wait for the user to pick** which files they will write themselves and which Claude should complete. Do not write any code until the user confirms.
