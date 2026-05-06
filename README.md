@@ -3,8 +3,8 @@
 A Spring Boot 4 / Java 26 project that demonstrates JPA, REST, Spring Security, and Kafka with the **transactional outbox** pattern.
 
 For deeper conceptual notes see:
-- [`spring-crud-guide.html`](spring-crud-guide.html) — Spring/JPA interview-style guide
-- [`kafka-guide.html`](kafka-guide.html) — Kafka + outbox + idempotency guide
+- [`spring-crud-guide.html`](spring-crud-guide.html) — Spring/JPA interview-style guide &nbsp;·&nbsp; [📖 preview](https://htmlpreview.github.io/?https://github.com/anish-kr07/spring-crud-with-kafka/blob/main/spring-crud-guide.html)
+- [`kafka-guide.html`](kafka-guide.html) — Kafka + outbox + idempotency guide &nbsp;·&nbsp; [📖 preview](https://htmlpreview.github.io/?https://github.com/anish-kr07/spring-crud-with-kafka/blob/main/kafka-guide.html)
 - [`docker-compose.md`](docker-compose.md) — Docker/Kafka command reference
 
 ---
