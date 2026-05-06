@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "find src/main/java src/test/java -name '*.java' 2>/dev/null | xargs wc -l 2>/dev/null | awk '$1 > 300 && $2 != \"total\" { print \"[LINE-BUDGET] OVER 300: \" $2 \" (\" $1 \" lines)\" }'"
+          }
+        ]
+      }
+    ]
+  }
+}

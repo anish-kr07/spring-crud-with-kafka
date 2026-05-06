@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Spring CRUD — Interview Guide</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 920px; margin: 2em auto; padding: 0 1em; line-height: 1.55; color: #222; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 0.2em; }
+  h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: 0.15em; }
+  h3 { margin-top: 1.4em; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  pre { background: #2b2b2b; color: #f8f8f2; padding: 0.8em 1em; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }
+  pre code { background: transparent; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 0.92em; }
+  th, td { border: 1px solid #ccc; padding: 0.45em 0.7em; vertical-align: top; text-align: left; }
+  th { background: #eee; }
+  .trap { background: #fff4e5; border-left: 4px solid #ff9800; padding: 0.6em 1em; margin: 0.8em 0; }
+  .gold { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 0.6em 1em; margin: 0.8em 0; }
+  ul li, ol li { margin: 0.25em 0; }
+</style>
+</head>
+<body>
+
+<h1>Spring CRUD — Interview Concept Guide</h1>
+<p>Compiled from the running <code>spring-crud</code> codebase (Spring Boot 4 + Java 26 + JPA + H2 + Spring Security). Each section answers a question an interviewer is likely to ask.</p>
+
+<h2>1. Configuration &amp; Profiles</h2>
+
+<table>
+<tr><th>Concept</th><th>What to know</th></tr>
+<tr><td><code>application.properties</code> vs <code>application-{profile}.properties</code></td><td>Profile file <em>overrides</em> the base file when that profile is active. Activate via <code>spring.profiles.active=dev</code>.</td></tr>
+<tr><td><code>@Profile("dev")</code></td><td>Bean only created when profile active. Other forms: <code>!prod</code>, <code>dev &amp; local</code>, <code>dev | local</code>.</td></tr>
+<tr><td><code>@ConfigurationProperties</code> vs <code>@Value</code></td><td>Production code uses <code>@ConfigurationProperties</code>: type-safe, supports nesting, validation. <code>@Value</code> is fine for one-off strings.</td></tr>
+<tr><td>Hikari pool</td><td>Default in Boot. Tune <code>maximum-pool-size</code>, <code>connection-timeout</code>, <code>leak-detection-threshold</code>. Default pool = 10.</td></tr>
+<tr><td><code>spring.jpa.open-in-view</code></td><td>Default <strong>true</strong> — keeps Hibernate session open through view rendering. The "correct" prod setting is <strong>false</strong> to surface lazy-loading bugs early.</td></tr>
+<tr><td><code>ddl-auto</code></td><td><code>none</code>/<code>validate</code>/<code>update</code>/<code>create</code>/<code>create-drop</code>. Use <code>validate</code> in prod with Flyway/Liquibase migrations. <code>update</code> is fine for learning.</td></tr>
+</table>
+
+<h3>1.1 Connection pool — why Hikari, why not size=1000</h3>
+
+<p><strong>Why we need a pool at all.</strong> Opening a database connection is expensive: TCP handshake, TLS negotiation, auth, server-side process/thread allocation (Postgres forks a process; MySQL spawns a thread), session state setup. Easily <strong>5–50 ms</strong> per open. A pool keeps a small set of connections warm and hands them out for the duration of one query/transaction, then returns them — typical acquire is sub-millisecond.</p>
+
+<p><strong>Why HikariCP specifically.</strong> Spring Boot 2+ ships it as the default. It's the fastest mainstream JDBC pool (lock-free fast path, ConcurrentBag), small (~130 KB jar), and battle-tested. You almost never need to swap it out.</p>
+
+<div class="gold"><strong>Interview gold — "Why can't we just set <code>maximum-pool-size=1000</code>?"</strong>
+<p>Because the bottleneck is the <em>database</em>, not the pool. The DB can't usefully process 1000 queries in parallel — and trying to do so makes things <em>slower</em>, not faster.</p>
+<ol>
+  <li><strong>DB-side cost per connection.</strong> Each connection is an OS-level resource on the database. Postgres: a separate backend process, ~5–10 MB RAM each, plus per-session <code>work_mem</code>. MySQL: a thread per connection. 1000 connections → multiple GB of DB RAM gone before a single query runs.</li>
+  <li><strong>Contention beats parallelism past a point.</strong> CPU cores are finite. Beyond ~2× cores worth of active connections, you're context-switching more than computing. Lock contention (row locks, latches, buffer-pool pages) climbs sharply.</li>
+  <li><strong>Little's Law.</strong> Throughput = concurrency / latency. If the DB can sustain 100 queries/sec at 10 ms each, raising concurrency to 1000 doesn't increase throughput — it just inflates the queue, pushing latency to 10 seconds.</li>
+  <li><strong>Storage saturates.</strong> Disk I/O queue depth and IOPS budget are fixed. More writers contending for the same WAL/redo log = more waiting.</li>
+  <li><strong>The pool stays cheap, but it doesn't help.</strong> Hikari can hand out 1000 connections in microseconds; the DB still processes them serially-ish at the bottleneck.</li>
+</ol>
+<p>The HikariCP wiki ("About Pool Sizing") cites a Postgres benchmark where throughput <em>peaks around 2× CPU cores + spindle count</em>, then <strong>drops</strong> as you add more connections. The starting formula:</p>
+<pre><code>connections = ((core_count * 2) + effective_spindle_count)</code></pre>
+<p>For a typical 8-core DB on SSD: ~17 connections. <em>Total across all app instances</em>, not per instance.</p>
+</div>
+
+<h4>Best tuning — knobs that matter</h4>
+<table>
+<tr><th>Property</th><th>Default</th><th>Recommended</th><th>Why</th></tr>
+<tr><td><code>maximum-pool-size</code></td><td>10</td><td>Start at 10. Raise only if monitoring shows pool saturation.</td><td>Small pool + fast queries beats large pool + slow queries.</td></tr>
+<tr><td><code>minimum-idle</code></td><td>= max</td><td>Leave equal to max → fixed-size pool</td><td>HikariCP author recommends fixed size — avoids connection churn from scale-down/up.</td></tr>
+<tr><td><code>connection-timeout</code></td><td>30 s</td><td>Keep at 30 s in dev; 1–5 s in latency-critical APIs</td><td>Time to wait when borrowing from a saturated pool. Fail fast if the DB is gone.</td></tr>
+<tr><td><code>idle-timeout</code></td><td>10 min</td><td>10 min, less than DB's idle limit</td><td>How long an idle connection above <code>minimum-idle</code> sticks around before being closed.</td></tr>
+<tr><td><code>max-lifetime</code></td><td>30 min</td><td>Set <strong>shorter than the DB's <code>wait_timeout</code></strong> (e.g. 25 min if MySQL <code>wait_timeout</code> is 28 min) and shorter than load-balancer/firewall idle kills</td><td>Cap on a connection's total lifetime. Forces refresh; avoids "connection closed by intermediary" errors.</td></tr>
+<tr><td><code>leak-detection-threshold</code></td><td>0 (off)</td><td>30 000–60 000 ms in dev, off in prod (or 2× p99 query time)</td><td>Logs a stack trace if a connection is held longer than this — finds bugs where code forgets to close a connection.</td></tr>
+<tr><td><code>validation-timeout</code></td><td>5 s</td><td>Default fine</td><td>Time to validate a connection before handing it out (uses JDBC4 <code>isValid</code>).</td></tr>
+</table>
+
+<h4>Sizing rules of thumb</h4>
+<ul>
+  <li><strong>Total connections across all app instances should be ≤ DB's <code>max_connections</code></strong>, leaving headroom for migrations/admin tools. 5 app instances × pool size 10 = 50 connections. Postgres default is 100 — you're at 50% before autoscaling.</li>
+  <li><strong>Match pool size to the bottleneck</strong>. If the DB is CPU-bound, ~(2 × cores). If I/O-bound (lots of disk waits), a bit higher. <em>Measure</em>, don't guess.</li>
+  <li><strong>Watch for pool-saturation alerts</strong>: <code>HikariPool-1 - Connection is not available, request timed out after 30000ms</code>. Means raise pool size <em>or</em> fix slow queries — usually the latter.</li>
+</ul>
+
+<h4>What to monitor</h4>
+<p>Spring Boot Actuator + Micrometer auto-exposes Hikari metrics (the project already has <code>spring-boot-starter-actuator</code>):</p>
+<table>
+<tr><td><code>hikaricp.connections.active</code></td><td>currently in use</td></tr>
+<tr><td><code>hikaricp.connections.idle</code></td><td>warm but unused</td></tr>
+<tr><td><code>hikaricp.connections.pending</code></td><td>threads waiting for a connection — &gt; 0 means the pool is too small or queries are too slow</td></tr>
+<tr><td><code>hikaricp.connections.usage</code></td><td>histogram: how long a connection is held (your transaction time + query time)</td></tr>
+<tr><td><code>hikaricp.connections.acquire</code></td><td>histogram: how long it took to <em>acquire</em> from the pool. p99 should be sub-ms in a healthy app</td></tr>
+</table>
+
+<h2>2. JPA Entities</h2>
+
+<h3>2.1 Lombok on entities — <code>@Data</code> is a TRAP</h3>
+<div class="trap"><strong>Use <code>@Getter</code> + <code>@Setter</code>, NOT <code>@Data</code> on JPA entities.</strong>
+<ul>
+  <li><code>@Data</code> generates <code>equals/hashCode</code> from <em>all</em> fields.</li>
+  <li>Before <code>save()</code>, <code>id</code> is null; after save, it changes — entity in a <code>HashSet</code> "disappears".</li>
+  <li><code>equals/hashCode</code> may touch lazy associations → surprise SQL or <code>LazyInitializationException</code>.</li>
+</ul>
+Safer: id-based equals or skip them entirely (what we do).</div>
+
+<h3>2.2 Annotations</h3>
+<table>
+<tr><th>Annotation</th><th>Notes</th></tr>
+<tr><td><code>@Id</code> + <code>@GeneratedValue(strategy=IDENTITY)</code></td><td>DB auto-increment. Hibernate <em>cannot batch inserts</em> with IDENTITY (it needs the generated id back per row). For bulk inserts prefer <code>SEQUENCE</code> with <code>allocationSize&gt;1</code>.</td></tr>
+<tr><td><code>@Column(nullable=false, unique=true, length=...)</code></td><td>Explicit DDL. Survives field renames.</td></tr>
+<tr><td><code>@Transient</code></td><td>JPA ignores this field/getter — not persisted. Different from Java's <code>transient</code> keyword (serialization).</td></tr>
+<tr><td><code>java.time.LocalDate</code></td><td>Hibernate 6+ handles <code>java.time</code> natively. No <code>@Temporal</code> needed (that was for <code>java.util.Date</code>).</td></tr>
+<tr><td>Money</td><td><strong>Never</strong> use <code>float</code>/<code>double</code>. Use <code>BigDecimal</code>.</td></tr>
+</table>
+
+<h2>3. Repositories</h2>
+<ul>
+  <li><code>JpaRepository&lt;Entity, Id&gt;</code> gives <code>save</code>, <code>findById</code>, <code>findAll</code>, <code>delete</code>, <code>count</code> via runtime proxy.</li>
+  <li><strong>Derived queries</strong>: method name parsed at startup — <code>findByEmail</code>, <code>findByDepartmentAndLastName</code>, <code>countByDepartment</code>, <code>existsByEmail</code>.</li>
+  <li><strong>JPQL via <code>@Query</code></strong>: use entity names (<code>Employee</code>, not <code>employees</code>), aliases (<code>select e from Employee e</code>), <code>:paramName</code> binding with <code>@Param</code>.</li>
+</ul>
+
+<div class="gold"><strong>Interview gold — <code>findById</code> vs <code>getReferenceById</code></strong>:
+<ul>
+  <li><code>findById(id)</code> — issues <code>SELECT</code>, returns full entity (or empty Optional).</li>
+  <li><code>getReferenceById(id)</code> — <strong>no SELECT</strong>, returns a lazy proxy. Perfect for FK assignment where you only need the id.</li>
+</ul>
+Pair <code>getReferenceById</code> with <code>existsById</code> upfront to get a clean 404 instead of a deferred <code>EntityNotFoundException</code>.</div>
+
+<h2>4. DTO pattern</h2>
+<ul>
+  <li><strong>Never return entities from controllers.</strong> Reasons: lazy-loading explosions, leaks internal fields (version, audit), couples API to schema.</li>
+  <li>Separate <code>EmployeeRequest</code> (inbound) from <code>EmployeeResponse</code> (outbound). Response can carry computed/derived fields the client never sends (e.g. <code>fullName</code>).</li>
+  <li>Use static factories (<code>EmployeeResponse.from(entity)</code>) — manual mapping is 5 lines and shows you understand the why.</li>
+  <li>Mapping libraries: <strong>MapStruct</strong> (compile-time, fast) &gt; <strong>ModelMapper</strong> (reflection, slow, surprising — avoid).</li>
+</ul>
+
+<h2>5. Validation (JSR-380 / Bean Validation)</h2>
+<table>
+<tr><th>Annotation</th><th>Use case</th></tr>
+<tr><td><code>@NotBlank</code></td><td>String only. Not null AND not "" AND not whitespace.</td></tr>
+<tr><td><code>@NotNull</code></td><td>Non-strings (<code>LocalDate</code>, <code>Integer</code>, etc.).</td></tr>
+<tr><td><code>@Email</code></td><td>Accepts empty string — combine with <code>@NotBlank</code>.</td></tr>
+<tr><td><code>@Size(min, max)</code></td><td>String/Collection length.</td></tr>
+<tr><td><code>@Positive</code> / <code>@PositiveOrZero</code></td><td>Numbers.</td></tr>
+<tr><td><code>@Past</code> / <code>@PastOrPresent</code> / <code>@Future</code></td><td>Dates.</td></tr>
+</table>
+
+<div class="trap"><strong>Where <code>@Valid</code> works:</strong> <code>@Valid @RequestBody DTO</code> on a controller — yes. <code>@Valid</code> on a service param — <strong>no</strong> by default. Service-level validation needs <code>@Validated</code> on the class plus AOP proxy.</div>
+
+<h2>6. Controllers — REST verbs</h2>
+<table>
+<tr><th>Verb</th><th>Body</th><th>Idempotent?</th><th>Status (success)</th><th>Status (missing)</th></tr>
+<tr><td>GET</td><td>none</td><td>✅</td><td>200</td><td>404</td></tr>
+<tr><td>POST</td><td>full DTO</td><td>❌</td><td><strong>201</strong> + <code>Location</code> header</td><td>—</td></tr>
+<tr><td>PUT</td><td>full DTO</td><td>✅</td><td>200 (with body) or 204</td><td>404</td></tr>
+<tr><td>PATCH</td><td>partial DTO</td><td>usually ✅</td><td>200</td><td>404</td></tr>
+<tr><td>DELETE</td><td>none</td><td>✅</td><td><strong>204</strong> No Content</td><td>404</td></tr>
+</table>
+
+<h3>PATCH needs its own DTO</h3>
+<ul>
+  <li>PATCH semantics: missing/null field = "leave alone".</li>
+  <li>Reusing the create DTO breaks PATCH because <code>@NotBlank</code> rejects partial bodies.</li>
+  <li>For numeric fields, use <strong>boxed types</strong> (<code>Integer</code>, not <code>int</code>) so <code>null</code> can mean "skip" — primitive <code>int</code> defaults to <code>0</code> and silently overwrites.</li>
+</ul>
+
+<h2>7. Service layer</h2>
+<ul>
+  <li><code>@Service</code> = stereotype of <code>@Component</code> for business logic.</li>
+  <li><strong>Constructor injection</strong> with <code>final</code> fields. No <code>@Autowired</code> when there's a single constructor — Spring picks it up automatically.</li>
+  <li><code>@Transactional(readOnly=true)</code> at class level for all reads. Override on writes with bare <code>@Transactional</code>.</li>
+</ul>
+
+<h3>7.1 Dirty checking — why no <code>save()</code> on update</h3>
+<div class="gold"><strong>Most-asked transaction question.</strong>
+<pre><code>@Transactional
+public void update(Long id, EmployeeRequest req) {
+    Employee e = repo.findById(id).orElseThrow(...);
+    e.setFirstName(req.getFirstName());
+    // no save() needed!
+}</code></pre>
+Why it works:
+<ol>
+  <li><code>findById</code> returns a <strong>managed</strong> entity tracked by the EntityManager.</li>
+  <li>Hibernate keeps a snapshot of original field values in the persistence context.</li>
+  <li>At commit, Hibernate auto-flushes, compares fields to snapshot, issues <code>UPDATE</code> for dirty fields.</li>
+</ol>
+<strong>Without <code>@Transactional</code></strong>: <code>findById</code> opens its own short tx, returns a detached entity, your setters mutate plain Java, <strong>no UPDATE is issued</strong> — silent bug.
+</div>
+
+<h3>7.2 Self-invocation pitfall</h3>
+<div class="trap">Calling a <code>@Transactional</code> method <em>from another method in the same class</em> bypasses the proxy → no transaction. Solution: split into another bean, or use <code>AopContext.currentProxy()</code>.</div>
+
+<h3>7.3 Rollback rules</h3>
+<ul>
+  <li>Spring rolls back <strong>only on <code>RuntimeException</code> and <code>Error</code></strong> by default.</li>
+  <li>Checked exceptions <strong>commit</strong> unless you add <code>@Transactional(rollbackFor = MyChecked.class)</code>.</li>
+</ul>
+
+<h2>8. Exception handling — <code>@RestControllerAdvice</code> + <code>ProblemDetail</code></h2>
+<ul>
+  <li><code>@RestControllerAdvice</code> = <code>@ControllerAdvice</code> + <code>@ResponseBody</code>. Spring routes any controller exception through its <code>@ExceptionHandler</code> methods, picking the <strong>most specific</strong> match.</li>
+  <li><code>ProblemDetail</code> (Spring 6 / Boot 3+, RFC 7807): built-in. Sets <code>application/problem+json</code> content type automatically. Use <code>setProperty</code> for extension fields.</li>
+</ul>
+
+<table>
+<tr><th>Exception</th><th>HTTP</th><th>Triggered by</th></tr>
+<tr><td>Custom <code>NotFoundException</code></td><td>404</td><td><code>findById().orElseThrow(...)</code></td></tr>
+<tr><td><code>MethodArgumentNotValidException</code></td><td>400</td><td><code>@Valid @RequestBody</code> failed</td></tr>
+<tr><td><code>HttpMessageNotReadableException</code></td><td>400</td><td>malformed JSON, bad date format</td></tr>
+<tr><td><code>DataIntegrityViolationException</code></td><td>409</td><td>UNIQUE constraint violation</td></tr>
+<tr><td><code>Exception</code> (catch-all)</td><td>500</td><td>last resort. <strong>Log stack trace, never return it.</strong></td></tr>
+</table>
+
+<div class="gold"><strong>Why custom <code>NotFoundException extends RuntimeException</code></strong>:
+<ul>
+  <li>Unchecked → no <code>throws</code> on every signature; works in lambdas (<code>orElseThrow(...)</code>).</li>
+  <li>Spring rolls back automatically (<code>RuntimeException</code>).</li>
+  <li>Decouples service from HTTP — service throws domain exception, advice maps to status. (Avoid <code>throw new ResponseStatusException(...)</code> in services for the same reason.)</li>
+</ul></div>
+
+<h2>9. JPA relationships — <code>@OneToMany</code> / <code>@ManyToOne</code></h2>
+
+<h3>9.1 Owning vs inverse side</h3>
+<p>Only ONE side owns the relationship — the side that <strong>holds the foreign key column</strong>.</p>
+<table>
+<tr><th>Side</th><th>Annotation</th><th>Owning?</th></tr>
+<tr><td><code>Employee.department</code> (FK lives here)</td><td><code>@ManyToOne @JoinColumn(name="department_id")</code></td><td>OWNING</td></tr>
+<tr><td><code>Department.employees</code></td><td><code>@OneToMany(mappedBy = "department")</code></td><td>INVERSE</td></tr>
+</table>
+<div class="trap"><strong>Forgetting <code>mappedBy</code></strong> — JPA assumes both sides own → creates a junction table <code>department_employees</code>. Extra table, extra inserts. Always declare <code>mappedBy</code> on the inverse side.</div>
+
+<h3>9.2 Fetch defaults</h3>
+<table>
+<tr><td><code>@ManyToOne</code></td><td>EAGER ❌ (the bad default)</td></tr>
+<tr><td><code>@OneToMany</code></td><td>LAZY ✅</td></tr>
+<tr><td><code>@OneToOne</code></td><td>EAGER ❌</td></tr>
+<tr><td><code>@ManyToMany</code></td><td>LAZY ✅</td></tr>
+</table>
+<p><strong>Always declare <code>fetch = LAZY</code> on <code>@ManyToOne</code></strong>. Override per-query with <code>@EntityGraph</code> or <code>JOIN FETCH</code> when needed.</p>
+
+<h3>9.3 Cascade and orphanRemoval</h3>
+<ul>
+  <li>Cascade lives on the <strong>parent's collection</strong> (<code>Department.employees</code>), not on the child.</li>
+  <li><code>CascadeType.REMOVE</code> — deletes children when parent is deleted.</li>
+  <li><code>orphanRemoval = true</code> — also deletes a child when it's <em>removed from the collection</em> (even without deleting the parent).</li>
+</ul>
+
+<h3>9.4 The N+1 problem</h3>
+<div class="gold"><strong>The single most-asked JPA interview question.</strong>
+<p>Naive: <code>departmentRepo.findAll()</code> + loop accessing <code>dept.getEmployees().size()</code>:</p>
+<pre><code>1 query : SELECT * FROM departments
+N queries: SELECT * FROM employees WHERE dept_id=?  -- per department</code></pre>
+For 100 departments → <strong>101 queries</strong>.
+<p><strong>Three fixes (know all three):</strong></p>
+<ol>
+  <li><code>@EntityGraph(attributePaths = "employees")</code> on the repository method — declarative, JPA standard.</li>
+  <li><code>JOIN FETCH</code> in JPQL: <code>select d from Department d left join fetch d.employees</code>.</li>
+  <li><code>@BatchSize(size=N)</code> on the collection — Hibernate-specific; loads lazy collections in batches.</li>
+</ol>
+</div>
+
+<h3>9.5 LazyInitializationException</h3>
+<ul>
+  <li>Touching a lazy field outside the persistence context throws <code>LazyInitializationException</code>.</li>
+  <li>Triggered most often when controllers serialize entities (avoid this — use DTOs).</li>
+  <li><code>spring.jpa.open-in-view=false</code> surfaces these bugs early in dev.</li>
+</ul>
+
+<h2>10. Spring Security basics</h2>
+<ul>
+  <li>Adding <code>spring-boot-starter-security</code> to <code>build.gradle</code> auto-secures every endpoint with HTTP Basic.</li>
+  <li>Default username = <code>user</code>, password = a generated UUID logged at startup.</li>
+  <li>Set <code>spring.security.user.name</code> / <code>spring.security.user.password</code> in <code>application.properties</code> to fix the password.</li>
+  <li>For real apps, write a <code>SecurityFilterChain</code> bean and define rules with <code>authorizeHttpRequests</code>. Add <code>@Configuration</code> + <code>@EnableWebSecurity</code> on the class.</li>
+  <li><strong>Disable CSRF for stateless APIs</strong> (<code>csrf.disable()</code>). Do NOT disable it for browser-based form apps.</li>
+</ul>
+
+<h2>11. HTTP &amp; status codes — cheat sheet</h2>
+<table>
+<tr><th>Code</th><th>Meaning</th><th>Use case</th></tr>
+<tr><td>200</td><td>OK</td><td>GET, PUT/PATCH success with body</td></tr>
+<tr><td>201</td><td>Created</td><td>POST success — include <code>Location</code> header</td></tr>
+<tr><td>204</td><td>No Content</td><td>DELETE success, or PUT with no body</td></tr>
+<tr><td>400</td><td>Bad Request</td><td>validation failure, malformed JSON</td></tr>
+<tr><td>401</td><td>Unauthorized</td><td>auth missing/invalid</td></tr>
+<tr><td>403</td><td>Forbidden</td><td>auth ok, action denied (e.g. CSRF rejected)</td></tr>
+<tr><td>404</td><td>Not Found</td><td>resource missing</td></tr>
+<tr><td>409</td><td>Conflict</td><td>unique constraint violation, optimistic-lock failure</td></tr>
+<tr><td>500</td><td>Internal Server Error</td><td>unhandled exception — never return stack traces to the client</td></tr>
+</table>
+
+<h2>12. Things to revisit</h2>
+<ul>
+  <li>Pagination: <code>Pageable</code>, <code>Page&lt;T&gt;</code> vs <code>Slice&lt;T&gt;</code> (Slice avoids the COUNT query).</li>
+  <li>Caching: <code>@EnableCaching</code>, <code>@Cacheable</code>, <code>@CacheEvict</code>. Default <code>ConcurrentMap</code> works in dev; swap to Caffeine in prod.</li>
+  <li>Auditing: <code>@EnableJpaAuditing</code>, <code>@CreatedDate</code>, <code>@LastModifiedDate</code>, <code>@EntityListeners(AuditingEntityListener.class)</code>.</li>
+  <li>Optimistic locking: <code>@Version Long version</code> → throws <code>OptimisticLockingFailureException</code> on concurrent updates.</li>
+  <li>Tests: <code>@DataJpaTest</code> (repo slice), <code>@WebMvcTest</code> (controller slice with <code>@MockitoBean</code>), <code>@SpringBootTest</code> (full context).</li>
+</ul>
+
+</body>
+</html>

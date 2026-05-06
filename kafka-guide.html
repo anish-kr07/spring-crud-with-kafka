@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Kafka — Interview Guide (spring-crud)</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 920px; margin: 2em auto; padding: 0 1em; line-height: 1.55; color: #222; }
+  h1 { border-bottom: 2px solid #333; padding-bottom: 0.2em; }
+  h2 { margin-top: 2em; border-bottom: 1px solid #ccc; padding-bottom: 0.15em; }
+  h3 { margin-top: 1.4em; }
+  h4 { margin-top: 1.2em; }
+  code { background: #f4f4f4; padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  pre { background: #2b2b2b; color: #f8f8f2; padding: 0.8em 1em; border-radius: 4px; overflow-x: auto; font-size: 0.85em; }
+  pre code { background: transparent; color: inherit; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 0.92em; }
+  th, td { border: 1px solid #ccc; padding: 0.45em 0.7em; vertical-align: top; text-align: left; }
+  th { background: #eee; }
+  .trap { background: #fff4e5; border-left: 4px solid #ff9800; padding: 0.6em 1em; margin: 0.8em 0; }
+  .gold { background: #e8f5e9; border-left: 4px solid #4caf50; padding: 0.6em 1em; margin: 0.8em 0; }
+  ul li, ol li { margin: 0.25em 0; }
+</style>
+</head>
+<body>
+
+<h1>Kafka — Interview Concept Guide</h1>
+<p>Compiled from the <code>spring-crud</code> codebase: local Kafka via docker-compose, Spring Kafka producer/consumer, and the <strong>transactional outbox</strong> pattern.</p>
+
+<h2>1. Why Kafka in this project</h2>
+<p>The synchronous REST API tells the client "I created the employee." We also want to <em>react</em> to that change asynchronously — projections, search indexing, notifications, analytics. Doing all of that in the request thread couples them to API latency and reliability.</p>
+<p>Kafka decouples by being a durable log: one writer, many independent readers, retention measured in days. The app writes once; downstream services react on their own schedules without the app knowing about them.</p>
+
+<h2>2. Cluster topology — KRaft, no Zookeeper</h2>
+<ul>
+  <li>Kafka 4.x runs in <strong>KRaft mode</strong> — internal Raft consensus replaces Zookeeper for cluster metadata.</li>
+  <li>In a single-node dev cluster (our setup), the same broker process plays both <em>controller</em> and <em>broker</em> roles.</li>
+  <li>Image used: <code>apache/kafka:3.9.0</code> (the official ASF image).</li>
+</ul>
+
+<h3>2.1 Multi-listener config — <code>KAFKA_LISTENERS</code></h3>
+<p>Brokers expose <strong>named listeners</strong> so different network paths get their own socket and security policy.</p>
+
+<pre><code>KAFKA_LISTENERS = "PLAINTEXT://:9092,CONTROLLER://:9093,INTERNAL://:9094"</code></pre>
+
+<table>
+<tr><th>Listener</th><th>Port</th><th>Used by</th></tr>
+<tr><td><code>PLAINTEXT</code></td><td>9092</td><td>Spring app on the host (mapped via compose <code>ports:</code>)</td></tr>
+<tr><td><code>CONTROLLER</code></td><td>9093</td><td>KRaft quorum traffic only — never clients</td></tr>
+<tr><td><code>INTERNAL</code></td><td>9094</td><td>Other containers on the docker network (Kafka UI)</td></tr>
+</table>
+
+<p>Two paired settings:</p>
+<ul>
+  <li><strong><code>KAFKA_LISTENERS</code></strong> — what sockets the broker binds.</li>
+  <li><strong><code>KAFKA_ADVERTISED_LISTENERS</code></strong> — what address the broker tells clients to use for follow-up traffic. Different per listener: <code>PLAINTEXT://localhost:9092</code> for host clients, <code>INTERNAL://kafka:9094</code> for container clients (docker DNS).</li>
+</ul>
+
+<div class="trap"><strong>Classic trap</strong>: "My consumer in a container can't reach Kafka, but my host consumer can." The broker advertises only <code>localhost:9092</code>. Inside a container, <code>localhost</code> means the container itself. Fix: add an <code>INTERNAL</code> listener and advertise the docker service name.</div>
+
+<h2>3. Topic vs Aggregate vs Event type — the three layers</h2>
+
+<p>This is the most-confusing-at-first concept set. Three different things at three different layers:</p>
+
+<table>
+<tr><th>Concept</th><th>Layer</th><th>Answers</th><th>Example</th></tr>
+<tr><td><strong>Topic</strong></td><td>Transport (Kafka)</td><td>"What channel does this travel on?"</td><td><code>employee.events</code></td></tr>
+<tr><td><strong>Aggregate type</strong></td><td>Domain (your code)</td><td>"What kind of thing is this event about?"</td><td><code>Employee</code></td></tr>
+<tr><td><strong>Aggregate id</strong></td><td>Domain (your code)</td><td>"<em>Which</em> one?"</td><td><code>42</code></td></tr>
+<tr><td><strong>Event type</strong></td><td>Domain (your code)</td><td>"What just happened to it?"</td><td><code>EmployeeCreated</code></td></tr>
+</table>
+
+<h3>3.1 Why one topic per aggregate, NOT one per event type</h3>
+
+<p>Naive design: <code>employee_created</code>, <code>employee_updated</code>, <code>employee_deleted</code> as separate topics. Industry-standard: one <code>employee.events</code> topic carrying all event types, with the type in a header.</p>
+
+<div class="gold"><strong>Reasons to use one-topic-per-aggregate</strong>:
+<ol>
+  <li><strong>Per-aggregate ordering.</strong> All events for employee 42 use <code>"42"</code> as the message key → hash to the same partition → strict order. With separate topics, "Created" and "Updated" are on different partitions and there's <em>no cross-topic ordering</em>; consumers may see Updated before Created.</li>
+  <li><strong>Fewer topics, simpler ops.</strong> Each topic is its own retention/replication/ACL config. 50 event types × per-type topics = 50 sets of decisions.</li>
+  <li><strong>New event types are free.</strong> Add <code>EmployeePromoted</code>: just publish. No broker change.</li>
+  <li><strong>Consumers want "all changes to this aggregate."</strong> A read-model projection subscribes once.</li>
+  <li><strong>Per-type topics encourage anemic streams.</strong> One channel per aggregate keeps "everything that happened" coherent.</li>
+</ol>
+Exceptions where per-event-type topics make sense: cross-domain pub/sub with very different consumers, different retention needs (snapshot vs delta), different ACLs.
+</div>
+
+<h3>3.2 Anatomy of a single message</h3>
+<pre><code>topic:     "employee.events"
+partition: 3                          ← derived from hash(key) % num_partitions
+offset:    9817                       ← position within the partition
+key:       "42"                       ← the aggregate id - controls partitioning
+headers:
+  event-type:     "EmployeeCreated"   ← what happened
+  aggregate-type: "Employee"          ← which kind of thing
+  outbox-id:      "17"                ← for consumer dedup
+value:     {"id":42, "firstName":"Hedy", ...}    ← payload (DTO as JSON)</code></pre>
+
+<p>A consumer dispatches by reading the header:</p>
+<pre><code>switch (headerValue(record, "event-type")) {
+    case "EmployeeCreated" -&gt; ...
+    case "EmployeeUpdated" -&gt; ...
+    case "EmployeeDeleted" -&gt; ...
+}</code></pre>
+
+<h2>4. Partitions, keys, and consumer groups</h2>
+
+<table>
+<tr><th>Concept</th><th>Notes</th></tr>
+<tr><td><strong>Partition</strong></td><td>A topic's unit of parallelism. Each partition is a strictly-ordered append-only log. <em>Order is guaranteed within a partition, never across partitions.</em></td></tr>
+<tr><td><strong>Message key</strong></td><td>Routing input. Default partitioner: <code>hash(key) % numPartitions</code>. Same key → same partition → ordered. <code>null</code> key → round-robin (no ordering).</td></tr>
+<tr><td><strong>Consumer group</strong></td><td>A set of consumers that <em>share</em> the topic's partitions. Members of the same group <strong>split</strong> the work; members of different groups each get the <strong>full stream</strong> (pub/sub fan-out).</td></tr>
+<tr><td><strong>Offset</strong></td><td>Per-partition position. Consumer <em>commits</em> offsets to remember "I've read up to here." On restart, it resumes from the committed offset.</td></tr>
+<tr><td><strong>Rebalance</strong></td><td>When a consumer joins/leaves the group, partitions are reassigned. Brief pause in consumption.</td></tr>
+</table>
+
+<div class="trap"><strong>Choosing partition count</strong>: Cannot decrease later (only increase, and that breaks key→partition stability). Pick a number that supports future scale. Common heuristic: target throughput per partition × number of consumers in the largest group.</div>
+
+<h3>4.1 Consumer group dynamics — what happens with multiple listener beans</h3>
+
+<p>This project has two listener beans (<code>EmployeeEventListener</code> and <code>DepartmentEventListener</code>) both with <code>groupId="spring-crud"</code>. Each becomes a separate consumer instance in the group at runtime. The way Kafka splits work between them depends on which topics they subscribe to:</p>
+
+<table>
+<tr><th>Setup</th><th>Result</th></tr>
+<tr><td>Two listeners, <strong>same group</strong>, <strong>same topic</strong></td><td>Kafka assigns each partition to exactly ONE consumer in the group. With a single-partition topic, only one listener gets messages — the other sits idle. <strong>Classic foot-gun.</strong></td></tr>
+<tr><td>Two listeners, <strong>same group</strong>, <strong>different topics</strong></td><td>Each listener owns its topic's partitions. No conflict. ✅ This is our setup: Employee listener gets <code>employee.events</code>, Department listener gets <code>department.events</code>.</td></tr>
+<tr><td>Two listeners, <strong>different groups</strong>, <strong>same topic</strong></td><td>Both listeners receive every message (pub/sub fan-out). Use this when one logical app needs two independent reactions to the same stream.</td></tr>
+</table>
+
+<div class="trap"><strong>Diagnosing this in logs.</strong> When the app starts you'll see lines like:
+<pre><code>[Consumer-1] Finished assignment for group at generation 24:
+  {consumer-spring-crud-1=Assignment(partitions=[department.events-0]),
+   consumer-spring-crud-2=Assignment(partitions=[employee.events-0])}</code></pre>
+Each listener's assigned partitions are listed. If a listener has empty assignment, it won't fire. Check this when "my consumer isn't getting messages" mysteries hit.</div>
+
+<h2>5. Producer config (Spring Boot properties)</h2>
+
+<table>
+<tr><th>Property</th><th>Value used</th><th>Why</th></tr>
+<tr><td><code>spring.kafka.bootstrap-servers</code></td><td><code>localhost:9092</code></td><td>Initial broker list. Client discovers the rest of the cluster.</td></tr>
+<tr><td><code>spring.kafka.producer.key-serializer</code></td><td><code>StringSerializer</code></td><td>Key is the aggregate id as String.</td></tr>
+<tr><td><code>spring.kafka.producer.value-serializer</code></td><td><code>StringSerializer</code></td><td>Outbox already stores JSON-as-String. Sending as String avoids double-encoding.</td></tr>
+<tr><td><code>spring.kafka.producer.acks</code></td><td><code>all</code></td><td>Leader waits for all in-sync replicas. Strongest durability. <code>1</code> = leader only. <code>0</code> = fire-and-forget.</td></tr>
+<tr><td><code>enable.idempotence</code></td><td><code>true</code></td><td>Producer-side dedup within a session. With <code>acks=all</code> + idempotence, a retry after a transient broker error doesn't create duplicates.</td></tr>
+<tr><td><code>retries</code></td><td><code>10</code></td><td>How many times the producer retries on transient failures.</td></tr>
+</table>
+
+<h3>5.1 Sync vs async send</h3>
+<p><code>kafkaTemplate.send(...)</code> returns a <code>CompletableFuture</code>. By default failures are silent unless you attach a callback. Two patterns:</p>
+<table>
+<tr><th>Pattern</th><th>Code</th><th>When to use</th></tr>
+<tr><td><strong>Async + callback</strong></td><td><code>send(...).whenComplete((r, ex) -&gt; ...)</code></td><td>Read-path / observability events where the request mustn't wait for Kafka. Failures are logged and dropped. Used by <code>DepartmentEventPublisher</code>.</td></tr>
+<tr><td><strong>Sync</strong></td><td><code>send(...).get(timeout)</code></td><td>State-change events that must be durably acked before "moving on" (mark outbox row as published). Used by <code>OutboxRelay</code>.</td></tr>
+</table>
+
+<h3>5.2 Why this project has its own <code>KafkaConfig</code> instead of relying on auto-config</h3>
+
+<p>Spring Boot auto-configures <code>KafkaTemplate&lt;?, ?&gt;</code> (generic wildcard). In Spring DI, <strong>generics are invariant</strong>: <code>KafkaTemplate&lt;?, ?&gt;</code> is NOT assignable to <code>KafkaTemplate&lt;String, String&gt;</code>. So a constructor that asks for the typed form fails:</p>
+
+<pre><code>Parameter 1 of constructor in OutboxRelay required a bean of type
+'org.springframework.kafka.core.KafkaTemplate' that could not be found.</code></pre>
+
+<p>Fix in <code>kafka/KafkaConfig.java</code>: declare typed <code>ProducerFactory&lt;String, String&gt;</code>, <code>KafkaTemplate&lt;String, String&gt;</code>, <code>ConsumerFactory&lt;String, String&gt;</code>, and <code>ConcurrentKafkaListenerContainerFactory&lt;String, String&gt;</code> beans explicitly. <code>@EnableKafka</code> on the same class activates <code>@KafkaListener</code> scanning.</p>
+
+<div class="gold"><strong>Bonus benefit</strong>: producer/consumer settings live in one auditable Java file rather than scattered across <code>application.properties</code>. In a real codebase that grows, the explicit config is easier to diff and review.</div>
+
+<h2>6. Consumer config</h2>
+
+<table>
+<tr><th>Property</th><th>Value used</th><th>Why</th></tr>
+<tr><td><code>group-id</code></td><td><code>spring-crud</code></td><td>Members of the same group share partitions.</td></tr>
+<tr><td><code>auto-offset-reset</code></td><td><code>earliest</code></td><td>What a NEW group does when there's no committed offset. <code>earliest</code> = read from the beginning. <code>latest</code> = only new messages. Friendlier in dev.</td></tr>
+<tr><td><code>key-deserializer</code> / <code>value-deserializer</code></td><td><code>StringDeserializer</code></td><td>Mirror of producer setup. Consumer parses JSON manually if it needs typed objects.</td></tr>
+<tr><td><code>spring.json.trusted.packages</code></td><td>(unused here)</td><td>Required when using <code>JsonDeserializer</code>. Restricts deserializable types — <code>"*"</code> is a security risk.</td></tr>
+</table>
+
+<h3>6.1 Auto vs manual ack</h3>
+<ul>
+  <li><strong>Auto</strong> (default): consumer commits offsets periodically. If the listener method throws after committing, that message is lost.</li>
+  <li><strong>Manual</strong>: declare an <code>Acknowledgment</code> param on the listener; call <code>ack.acknowledge()</code> only after successful processing. Safer for at-least-once.</li>
+</ul>
+
+<h2>7. Transactional outbox pattern (the textbook event publisher)</h2>
+
+<h3>7.1 The problem it solves</h3>
+<p>You want to publish a Kafka event when an Employee is created. The naive code:</p>
+<pre><code>@Transactional
+public void create(...) {
+    employeeRepo.save(emp);
+    kafkaTemplate.send("employee.events", emp);   // ← THE BUG
+}</code></pre>
+<div class="trap">Failure modes:
+<ul>
+  <li>Kafka is down → send throws → DB rolls back. Business write fails because of an unrelated downstream system. ❌</li>
+  <li>Kafka accepts the message but the DB tx rolls back later → "ghost" event for an employee who doesn't exist. ❌</li>
+  <li>App crashes between save and send → DB has the row, Kafka doesn't → silent data divergence. ❌</li>
+</ul>
+This is the <strong>dual-write problem</strong>: writing to two systems atomically with no shared transaction.
+</div>
+
+<h3>7.2 The pattern</h3>
+<ol>
+  <li>In the same DB transaction as the business write, INSERT a row into an <code>outbox_events</code> table.</li>
+  <li>Both rows commit atomically — same DB, same tx. No dual-write.</li>
+  <li>A separate background poller reads unpublished outbox rows and pushes them to Kafka.</li>
+  <li>On successful publish, the poller marks the row as published.</li>
+</ol>
+
+<pre><code>POST /v1/employees
+   └─ EmployeeService.create()  [@Transactional]
+        ├─ employeeRepo.save(e)              ← INSERT employees
+        └─ outboxPublisher.record(...)       ← INSERT outbox_events
+                                               (atomic — same tx)
+
+every 1s:
+   OutboxRelay.publishPending()  [@Transactional]
+        ├─ findUnpublishedForUpdate(50)      ← SELECT FOR UPDATE
+        ├─ kafkaTemplate.send(...).get()     ← wait for broker ack
+        └─ event.setPublishedAt(now())       ← UPDATE outbox_events
+
+EmployeeEventListener — separate consumer thread
+        └─ logs the event</code></pre>
+
+<h3>7.3 Outbox table shape</h3>
+<table>
+<tr><th>Column</th><th>Purpose</th></tr>
+<tr><td><code>id</code></td><td>PK (auto-increment)</td></tr>
+<tr><td><code>aggregate_type</code></td><td>"Employee"</td></tr>
+<tr><td><code>aggregate_id</code></td><td>"42" — used as Kafka <em>message key</em></td></tr>
+<tr><td><code>event_type</code></td><td>"EmployeeCreated", "EmployeeUpdated", ... — sent as Kafka header</td></tr>
+<tr><td><code>payload</code></td><td>JSON String (serialized DTO)</td></tr>
+<tr><td><code>created_at</code></td><td>For ordering</td></tr>
+<tr><td><code>published_at</code></td><td>NULL = not yet sent. Indexed: <code>(published_at, created_at)</code></td></tr>
+</table>
+
+<h3>7.4 Key implementation details</h3>
+
+<h4>Propagation.MANDATORY on the publisher</h4>
+<pre><code>@Transactional(propagation = Propagation.MANDATORY)
+public void record(...) { ... }</code></pre>
+<p><strong>Asserts</strong> that this method must be called from within an existing transaction. If the caller forgot <code>@Transactional</code>, this throws — failing loud rather than silently breaking atomicity.</p>
+
+<h4>Pessimistic lock on the relay's read</h4>
+<pre><code>@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select e from OutboxEvent e where e.publishedAt is null order by e.createdAt asc")
+List&lt;OutboxEvent&gt; findUnpublishedForUpdate(Limit limit);</code></pre>
+<p>Generates <code>SELECT ... FOR UPDATE</code>. Without it, two poller instances would race and double-publish.</p>
+
+<div class="gold"><strong>SKIP LOCKED</strong> — the multi-instance upgrade.<br>
+Plain <code>FOR UPDATE</code> serializes pollers (one waits for the other). The textbook fix is <code>SELECT ... FOR UPDATE SKIP LOCKED</code> — pollers grab different rows, run in parallel, no contention. Enable in JPA via Hibernate hint:
+<pre><code>@QueryHints(@QueryHint(name = "jakarta.persistence.lock.timeout", value = "-2"))</code></pre>
+Supported on Postgres, MySQL 8+, H2.</div>
+
+<h4>Sync send + tx rollback on failure</h4>
+<pre><code>kafkaTemplate.send(record).get(10, TimeUnit.SECONDS);
+e.setPublishedAt(Instant.now());</code></pre>
+<p>If the broker doesn't ack within 10s, the future throws → relay's <code>@Transactional</code> rolls back → none of the <code>publishedAt</code> updates from this batch commit → next poll retries the whole batch.</p>
+
+<h3>7.5 Delivery guarantee</h3>
+<div class="trap"><strong>At-least-once, NOT exactly-once.</strong>
+<ul>
+  <li>The relay sends to Kafka, then marks <code>published_at</code>. If the JVM dies between broker ack and the DB commit, the row is re-sent next poll.</li>
+  <li>Consumers <strong>must be idempotent</strong>. Use the <code>outbox-id</code> header (or partition+offset) plus a <code>processed_events</code> table to skip duplicates.</li>
+</ul>
+True exactly-once across a DB and Kafka requires <strong>Kafka transactions + transaction-aware DB</strong> — much heavier and rarely needed.
+</div>
+
+<h3>7.6 Alternative: CDC (Debezium)</h3>
+<p>Instead of polling, stream the database WAL/binlog into Kafka with <strong>Debezium</strong>. Same effect — at-least-once events that are atomic with DB writes — without app code. Trade-off: a Kafka Connect cluster to operate.</p>
+
+<h3>7.7 Outbox vs direct publish — when to use each</h3>
+
+<p>This project demonstrates BOTH patterns side by side. <code>EmployeeService</code> uses outbox (<code>OutboxPublisher</code> + <code>OutboxRelay</code>). <code>DepartmentService</code> publishes directly via <code>DepartmentEventPublisher</code>. The right choice depends on what you'd lose if the event went missing.</p>
+
+<table>
+<tr><th></th><th>Outbox (Employee)</th><th>Direct publish (Department)</th></tr>
+<tr><td>Trigger</td><td>DB write (create / update / delete)</td><td>DB read (<code>findById</code>) and DB write (<code>create</code>)</td></tr>
+<tr><td>Atomic with DB tx?</td><td>✅ Yes — outbox row commits iff business write commits</td><td>❌ No — Kafka send is independent of any DB tx</td></tr>
+<tr><td>Send mode</td><td>Sync <code>.get()</code>, retry on failure via tx rollback</td><td>Async <code>.whenComplete()</code> with failure-logging callback</td></tr>
+<tr><td>Latency added to API request</td><td>None (relay runs on a separate thread)</td><td>Tiny (just a non-blocking <code>send()</code> call)</td></tr>
+<tr><td>If Kafka is down at the moment of write</td><td>Event sits in <code>outbox_events</code>, retried until Kafka returns. <strong>Not lost.</strong></td><td>Event is logged and dropped. <strong>Lost.</strong></td></tr>
+<tr><td>Right for…</td><td>Domain state changes — anything where consumers must see every event for correctness (read-model projections, cross-service workflows)</td><td>Audit / observability / analytics — events that are useful but not load-bearing</td></tr>
+</table>
+
+<div class="trap"><strong>Don't use direct publish for state changes.</strong> Department creation events here are direct-publish for simplicity, but in a real system that's wrong: a downstream consumer could miss "Department X was created" forever, and your read-model would be permanently stale. The outbox is the safe default; only deviate when the event is genuinely throwaway.</div>
+
+<h3>7.8 Multiple event types on one topic — dispatch pattern</h3>
+
+<p>Both <code>employee.events</code> and <code>department.events</code> carry multiple event types in a single topic (<code>EmployeeCreated</code>, <code>EmployeeUpdated</code>, <code>EmployeeDeleted</code>, <code>EmployeePatched</code>; <code>DepartmentCreated</code>, <code>DepartmentLookedUp</code>). The producer puts the type in a header; the consumer dispatches on it.</p>
+
+<pre><code>// Producer side (DepartmentEventPublisher.publish)
+record.headers().add("event-type", eventType.getBytes(StandardCharsets.UTF_8));
+
+// Consumer side (DepartmentEventListener)
+String eventType = headerValue(record, "event-type");
+switch (eventType) {
+    case "DepartmentLookedUp" -&gt; log.info("findByDeprtId was called — ...");
+    case "DepartmentCreated"  -&gt; log.info("Department created — ...");
+    default                   -&gt; log.warn("unknown event-type=...");
+}</code></pre>
+
+<p>Why this beats one-topic-per-event-type: see § 3.1 (per-aggregate ordering, fewer topics, free new event types). The header-dispatch is a small extra branch in the consumer in exchange for those benefits.</p>
+
+<h2>8. Retention policy — where to set it</h2>
+
+<p>Kafka keeps messages for a configurable time/size. Once retention is exceeded, segments are deleted (or compacted).</p>
+
+<h3>8.1 The two flavors</h3>
+<table>
+<tr><th>Policy</th><th>Behavior</th><th>Use case</th></tr>
+<tr><td><code>cleanup.policy=delete</code> (default)</td><td>Drop old segments based on time or size</td><td>Event streams (most cases)</td></tr>
+<tr><td><code>cleanup.policy=compact</code></td><td>Keep latest message per key, drop older</td><td>"Current state" topics — change-data-capture, snapshots</td></tr>
+<tr><td><code>cleanup.policy=compact,delete</code></td><td>Both — compact AND age out</td><td>Change-log with maximum retention</td></tr>
+</table>
+
+<h3>8.2 Where you can set it (most → least specific)</h3>
+
+<h4>Per-topic at create time (most common)</h4>
+<pre><code>kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic employee.events --partitions 3 --replication-factor 1 \
+  --config retention.ms=604800000 \
+  --config retention.bytes=10737418240 \
+  --config cleanup.policy=delete</code></pre>
+
+<h4>Per-topic on an existing topic</h4>
+<pre><code>kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name employee.events \
+  --alter --add-config retention.ms=259200000</code></pre>
+
+<h4>From Spring Boot via <code>KafkaAdmin</code></h4>
+<p>Declarative — Spring Kafka creates topics on startup if they don't exist:</p>
+<pre><code>@Bean
+public NewTopic employeeEventsTopic() {
+    return TopicBuilder.name("employee.events")
+            .partitions(3)
+            .replicas(1)
+            .config(TopicConfig.RETENTION_MS_CONFIG, "604800000")     // 7 days
+            .config(TopicConfig.CLEANUP_POLICY_CONFIG, "delete")
+            .build();
+}</code></pre>
+
+<h4>Cluster-wide defaults (broker config)</h4>
+<p>In <code>server.properties</code> or via env vars on the broker container. These are the <em>fallback</em> when a topic doesn't override.</p>
+<table>
+<tr><th>Broker setting</th><th>Default</th><th>Compose env-var (apache/kafka)</th></tr>
+<tr><td><code>log.retention.hours</code></td><td>168 (7 days)</td><td><code>KAFKA_LOG_RETENTION_HOURS</code></td></tr>
+<tr><td><code>log.retention.minutes</code></td><td>—</td><td><code>KAFKA_LOG_RETENTION_MINUTES</code></td></tr>
+<tr><td><code>log.retention.ms</code></td><td>—</td><td><code>KAFKA_LOG_RETENTION_MS</code></td></tr>
+<tr><td><code>log.retention.bytes</code></td><td>−1 (unlimited)</td><td><code>KAFKA_LOG_RETENTION_BYTES</code></td></tr>
+<tr><td><code>log.segment.bytes</code></td><td>1 GB</td><td><code>KAFKA_LOG_SEGMENT_BYTES</code></td></tr>
+<tr><td><code>log.cleanup.policy</code></td><td><code>delete</code></td><td><code>KAFKA_LOG_CLEANUP_POLICY</code></td></tr>
+</table>
+
+<h3>8.3 Useful per-topic configs to know</h3>
+<table>
+<tr><th>Property</th><th>Meaning</th></tr>
+<tr><td><code>retention.ms</code></td><td>Time-based retention (per partition).</td></tr>
+<tr><td><code>retention.bytes</code></td><td>Size-based retention (per partition).</td></tr>
+<tr><td><code>segment.ms</code> / <code>segment.bytes</code></td><td>When does Kafka roll a new log segment? Old segments are eligible for deletion.</td></tr>
+<tr><td><code>min.insync.replicas</code></td><td>For <code>acks=all</code>: minimum replicas that must ack. <code>2</code> on a 3-broker cluster gives durability + tolerates 1 failure.</td></tr>
+<tr><td><code>cleanup.policy</code></td><td><code>delete</code> | <code>compact</code> | <code>compact,delete</code></td></tr>
+<tr><td><code>compression.type</code></td><td><code>producer</code> | <code>none</code> | <code>gzip</code> | <code>snappy</code> | <code>lz4</code> | <code>zstd</code></td></tr>
+</table>
+
+<div class="gold"><strong>Practical rule of thumb</strong>:
+<ul>
+  <li>Time retention: 7 days for event topics, longer for audit/replay-on-bug-fix scenarios.</li>
+  <li>Size retention: cap to protect disk if events spike.</li>
+  <li>Both can coexist — Kafka deletes when EITHER limit is reached.</li>
+</ul></div>
+
+<h2>9. End-to-end flow</h2>
+
+<p>What actually happens when a client calls <code>POST /v1/employees</code>, traced across all three threads involved.</p>
+
+<table>
+<tr><th>Thread</th><th>Triggered by</th><th>Lifetime</th></tr>
+<tr><td>HTTP / Tomcat</td><td>incoming request</td><td>millis — until response sent</td></tr>
+<tr><td>Spring TaskScheduler</td><td><code>@Scheduled(fixedDelay=1000)</code></td><td>~1s ticks, forever</td></tr>
+<tr><td>Kafka consumer</td><td>broker poll loop</td><td>continuously</td></tr>
+</table>
+
+<h3>9.1 Phase A — HTTP request thread (Tomcat)</h3>
+<pre><code>Client → POST /v1/employees {firstName, ..., departmentId:1}
+   │
+   ├── Spring Security chain (permitAll) → through
+   ├── DispatcherServlet → EmployeeController.addEmployee
+   ├── @Valid validates EmployeeRequest (JSR-380)
+   │
+   └── EmployeeService.create(req)        ┐
+       │                                   │
+       │  resolveDepartment(1)             │
+       │     ├── existsById(1)             │  ALL IN ONE
+       │     └── getReferenceById(1)       │  DB TRANSACTION
+       │         (proxy, no SELECT)        │  (@Transactional)
+       │                                   │
+       │  employeeRepo.save(e)             │
+       │     → INSERT INTO employees       │
+       │                                   │
+       │  outboxPublisher.record(...)      │
+       │     @Propagation.MANDATORY        │
+       │     → INSERT INTO outbox_events   │
+       │                                   ┘
+       └── tx commits  ← both rows committed atomically
+
+Client ← 201 Created + Location: /v1/employees/42</code></pre>
+<p>End of Phase A: <strong>DB has both rows. Client got 201. Kafka still has nothing.</strong> The client doesn't wait for Kafka.</p>
+
+<h3>9.2 Phase B — Scheduler thread (every 1s)</h3>
+<pre><code>@Scheduled tick → OutboxRelay.publishPending()  [@Transactional]
+   │
+   ├── findUnpublishedForUpdate(50)
+   │     → SELECT * FROM outbox_events
+   │        WHERE published_at IS NULL
+   │        ORDER BY created_at
+   │        FOR UPDATE              ← row lock
+   │
+   └── for each row:
+         ├── ProducerRecord:
+         │     topic     = "employee.events"
+         │     key       = "42"           ← partition routing
+         │     headers   = event-type=EmployeeCreated,
+         │                 aggregate-type=Employee,
+         │                 outbox-id=17
+         │     value     = {"id":42, ...}
+         │
+         ├── kafkaTemplate.send(record).get(10s)
+         │     → broker hashes key → partition 3
+         │     → broker writes to partition log
+         │     → with acks=all: leader waits for ISR replicas
+         │     → broker acks
+         │
+         └── event.setPublishedAt(now())
+   │
+   └── tx commits → UPDATE outbox_events SET published_at=now()</code></pre>
+<p>End of Phase B: <strong>message durably on the broker; row marked published.</strong></p>
+
+<h3>9.3 Phase C — Kafka consumer thread</h3>
+<pre><code>Kafka client poll loop → sees new message on partition 3
+   │
+   ├── Spring Kafka container invokes
+   │   EmployeeEventListener.onEvent(record)
+   │
+   ├── eventType = record.headers().lastHeader("event-type")
+   │            = "EmployeeCreated"
+   │
+   ├── log.info("[consumer] event-type=EmployeeCreated key=42 ...")
+   │
+   └── auto-commit offset → "done with this message"</code></pre>
+
+<h3>9.4 Failure scenarios — why this design holds</h3>
+<table>
+<tr><th>What fails</th><th>What happens</th><th>Result</th></tr>
+<tr><td>Kafka <strong>down</strong> during Phase A</td><td>Phase A doesn't touch Kafka. DB tx commits. Outbox row sits with <code>published_at=null</code>.</td><td>Phase B retries every 1s; publishes when Kafka returns. ✅</td></tr>
+<tr><td>Kafka <strong>down</strong> during Phase B</td><td><code>send().get(10s)</code> throws TimeoutException → relay tx rolls back.</td><td>Same batch retried next tick. ✅</td></tr>
+<tr><td>App <strong>crashes</strong> after broker ack but before DB commit (Phase B step 13→14)</td><td>Row stays unpublished in DB; broker has the message.</td><td>Same row re-published next tick → <strong>duplicate at consumer</strong>. At-least-once. Consumer must dedupe (e.g. via <code>outbox-id</code> header).</td></tr>
+<tr><td>DB <strong>rolls back</strong> Phase A (e.g. unique-email constraint)</td><td>Both <code>employees</code> INSERT and <code>outbox_events</code> INSERT roll back together.</td><td>No ghost event. ✅</td></tr>
+<tr><td>Consumer <strong>crashes</strong> mid-processing</td><td>Offset not yet committed.</td><td>Restart re-reads same message. At-least-once. Listener must be idempotent.</td></tr>
+<tr><td>Multiple relay instances racing on same rows</td><td><code>SELECT FOR UPDATE</code> serializes them.</td><td>One waits for the other; no double-publish. (Add <code>SKIP LOCKED</code> for parallel pollers — see § 7.4.)</td></tr>
+</table>
+
+<div class="gold"><strong>The whole point</strong>: every failure degrades to <em>at-least-once</em> — the strongest guarantee available without 2PC. No silent data loss, no ghost events. Duplicates are the consumer's problem, and they're a solvable problem (dedup table keyed by <code>outbox-id</code>).</div>
+
+<h2>10. Idempotency — making sure no duplicates leak through</h2>
+
+<p>At-least-once delivery means duplicates can happen. Three places, three answers — you need a strategy at each layer, but only the third actually requires you to write app code.</p>
+
+<h3>10.1 Layer 1 — producer-side duplicates</h3>
+<p><strong>Cause</strong>: producer retries (transient broker errors) cause the same message to be appended twice on the broker.</p>
+<p><strong>Solution</strong>: <code>enable.idempotence=true</code> on the producer (already set in <code>KafkaConfig</code>). The broker assigns a producer id + sequence number to each message; duplicate sequence numbers from the same producer are rejected.</p>
+<p><strong>Status</strong>: ✅ already handled.</p>
+
+<h3>10.2 Layer 2 — outbox relay duplicates</h3>
+<p><strong>Cause</strong>: relay sends to Kafka → broker acks → JVM dies before the DB <code>UPDATE outbox_events SET published_at=now()</code> commits. Next poll re-sends the same row.</p>
+<p><strong>Solution</strong>: cannot prevent this on the producer side — it's the inherent at-least-once trade-off. The fix lives in the consumer (Layer 3).</p>
+
+<h3>10.3 Layer 3 — consumer-side dedupe (the one you write)</h3>
+
+<p>Even with both layers above, a consumer can crash after processing a message but before its offset is committed. On restart it re-reads the message. So consumers that have side effects MUST dedupe.</p>
+
+<h4>The pattern</h4>
+<pre><code>CREATE TABLE processed_events (
+    event_id     VARCHAR(64) PRIMARY KEY,
+    processed_at TIMESTAMP NOT NULL
+);</code></pre>
+
+<pre><code>@Transactional
+public void onEvent(ConsumerRecord&lt;String, String&gt; record) {
+    String eventId = headerValue(record, "outbox-id");
+    if (processedEventRepo.existsById(eventId)) {
+        log.info("Skipping duplicate eventId={}", eventId);
+        return;
+    }
+
+    // ... do the real side-effect work ...
+
+    processedEventRepo.save(new ProcessedEvent(eventId, Instant.now()));
+}</code></pre>
+
+<div class="gold"><strong>Critical detail</strong>: the <code>existsById</code> check, the side-effect work, and the dedupe insert MUST run in the same DB transaction. Otherwise: process side effect → crash → dedupe row never written → next replay double-processes. Same dual-write problem flipped around.</div>
+
+<h4>Choosing the unique id</h4>
+<table>
+<tr><th>Source</th><th>When to use</th></tr>
+<tr><td><code>outbox-id</code> header</td><td>Best for outbox-driven flows (Employee). The relay sets this from the row's <code>id</code>; globally unique within the app.</td></tr>
+<tr><td>Producer-generated UUID header</td><td>For direct-publish flows (Department). Caveat: with async fire-and-forget there's no producer retry, so each call already produces one message — dedupe mostly insures against consumer-side replays.</td></tr>
+<tr><td>Business key</td><td>Best when the message has natural identity (e.g. <code>employee_id + version</code>). Doubles as your idempotency token in business logic.</td></tr>
+<tr><td><code>partition + offset</code></td><td>Works for any topic, but breaks if you ever reset offsets and reprocess from the beginning.</td></tr>
+</table>
+
+<h4>Naturally idempotent operations — when you can skip the dedupe table</h4>
+<table>
+<tr><th>Side effect</th><th>Idempotent?</th></tr>
+<tr><td><code>UPDATE rows SET status = ? WHERE id = ?</code></td><td>✅ Running twice is the same as once.</td></tr>
+<tr><td><code>INSERT ... ON CONFLICT DO NOTHING</code> (Postgres) / <code>ON DUPLICATE KEY UPDATE</code> (MySQL)</td><td>✅ Built-in upsert idempotence.</td></tr>
+<tr><td><code>SET balance = $X</code></td><td>✅ Absolute set.</td></tr>
+<tr><td><code>balance = balance + $X</code></td><td>❌ Increment — must dedupe.</td></tr>
+<tr><td>Send email / SMS / webhook</td><td>❌ External side effect — must dedupe.</td></tr>
+<tr><td>Append-only audit log</td><td>❌ Two log lines for one event — must dedupe (or accept noise).</td></tr>
+</table>
+
+<div class="gold"><strong>Design preference</strong>: make ops idempotent at the data layer when you can (upsert, absolute set). Reach for an explicit dedupe table only when the operation is inherently non-idempotent.</div>
+
+<h3>10.4 Operational hygiene</h3>
+<ul>
+  <li><strong>Bound the dedupe table size</strong>: it grows forever. Add a TTL/cleanup job (e.g. delete rows older than 7 days) once the broker can no longer replay older messages anyway.</li>
+  <li><strong>Match the dedupe window to the retention window</strong>: if Kafka keeps messages 7 days and you dedupe with 7-day retention, you cover every possible replay.</li>
+  <li><strong>Don't dedupe pure audit/log events</strong>: an extra log line is harmless. Save the dedupe-table cost for state-affecting handlers.</li>
+</ul>
+
+<h2>11. Operating the local cluster (CLI reference)</h2>
+
+<p>All commands run inside the broker container via <code>docker exec</code>. The Apache Kafka image (<code>apache/kafka:3.9.0</code>) ships the standard scripts under <code>/opt/kafka/bin/</code>. Each subsection below lists the <strong>generic form</strong> first, then a <strong>project-specific example</strong>.</p>
+
+<p>Conventions used:</p>
+<ul>
+  <li><code>BS=</code> placeholder for <code>--bootstrap-server &lt;host:port&gt;</code></li>
+  <li>For this project: <code>--bootstrap-server localhost:9092</code> (executed inside the broker container, so <code>localhost</code> is the broker itself)</li>
+  <li>Web UI alternative: <a href="http://localhost:8090">http://localhost:8090</a> (Provectus Kafka UI)</li>
+</ul>
+
+<h3>11.1 Topic management — <code>kafka-topics.sh</code></h3>
+
+<h4>List topics</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-topics.sh BS --list</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --list</code></pre></td></tr>
+<tr><th>Output</th><td><pre><code>__consumer_offsets
+department.events
+employee.events</code></pre><code>__consumer_offsets</code> is Kafka's internal topic that stores committed offsets for every consumer group — never manage it directly.</td></tr>
+</table>
+
+<h4>Describe a topic</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-topics.sh BS --describe --topic &lt;name&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic employee.events</code></pre></td></tr>
+<tr><th>Output (key fields)</th><td>Partitions, ReplicationFactor, ISR (in-sync replicas), per-partition Leader, Replicas, Configs (only non-default).</td></tr>
+</table>
+
+<h4>Create a topic explicitly</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-topics.sh BS --create --topic &lt;name&gt; --partitions &lt;n&gt; --replication-factor &lt;m&gt; [--config k=v ...]</code></td></tr>
+<tr><th>Project (optional — auto-create is on)</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --create --topic employee.events.DLT \
+  --partitions 1 --replication-factor 1 \
+  --config retention.ms=2592000000</code></pre></td></tr>
+</table>
+
+<h4>Add partitions to an existing topic</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-topics.sh BS --alter --topic &lt;name&gt; --partitions &lt;new-count&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 \
+  --alter --topic employee.events --partitions 3</code></pre></td></tr>
+<tr><th>Caveat</th><td>You can only INCREASE partitions, never decrease. Increasing breaks key→partition stability for any keys that hash differently after the change.</td></tr>
+</table>
+
+<h4>Delete a topic</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-topics.sh BS --delete --topic &lt;name&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --delete --topic some.test.topic</code></pre></td></tr>
+</table>
+
+<h3>11.2 Consume messages — <code>kafka-console-consumer.sh</code></h3>
+
+<h4>Tail current messages (latest only)</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-console-consumer.sh BS --topic &lt;name&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec -it spring-crud-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic employee.events</code></pre></td></tr>
+</table>
+
+<h4>Read from the beginning, with key + headers</h4>
+<table>
+<tr><th>Generic</th><td><pre><code>kafka-console-consumer.sh BS --topic &lt;name&gt; \
+  --from-beginning \
+  --property print.key=true \
+  --property print.headers=true \
+  --property key.separator=" | "</code></pre></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec -it spring-crud-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic department.events \
+  --from-beginning \
+  --property print.key=true \
+  --property print.headers=true \
+  --property key.separator=" | "</code></pre></td></tr>
+<tr><th>Output</th><td><pre><code>event-type:DepartmentLookedUp,aggregate-type:Department  1 | {"departmentId":1,"departmentName":"Engineering","occurredAt":"2026-05-06T..."}
+event-type:DepartmentCreated                              4 | {"departmentId":4,"departmentName":"DemoDept-1234","occurredAt":"..."}</code></pre></td></tr>
+</table>
+
+<h4>Read a specific partition / from a specific offset</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-console-consumer.sh BS --topic &lt;name&gt; --partition &lt;p&gt; --offset &lt;n&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec -it spring-crud-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic employee.events --partition 0 --offset 0</code></pre></td></tr>
+<tr><th>Notes</th><td><code>--offset earliest</code> / <code>--offset latest</code> work too. <code>--max-messages N</code> stops after reading N records.</td></tr>
+</table>
+
+<h3>11.3 Produce messages — <code>kafka-console-producer.sh</code></h3>
+
+<h4>Send messages from stdin</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-console-producer.sh BS --topic &lt;name&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec -i spring-crud-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic employee.events \
+  &lt;&lt;&lt; 'manual test message'</code></pre></td></tr>
+<tr><th>Effect</th><td>The Spring listener picks it up and logs it under "Employee event received". Useful for testing consumer behavior without going through the API.</td></tr>
+</table>
+
+<h4>Send with key + headers</h4>
+<table>
+<tr><th>Generic</th><td><pre><code>kafka-console-producer.sh BS --topic &lt;name&gt; \
+  --property parse.key=true \
+  --property key.separator="|" \
+  --property parse.headers=true \
+  --property headers.delimiter="\t" \
+  --property headers.separator=","</code></pre></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec -i spring-crud-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --bootstrap-server localhost:9092 --topic department.events \
+  --property parse.key=true --property key.separator="|" \
+  --property parse.headers=true \
+  --property headers.delimiter="\t" \
+  --property headers.separator="," \
+  &lt;&lt;'EOF'
+event-type:DepartmentLookedUp	99|{"departmentId":99,"departmentName":"Manual","occurredAt":"2026-05-06T00:00:00Z"}
+EOF</code></pre></td></tr>
+</table>
+
+<h3>11.4 Consumer groups — <code>kafka-consumer-groups.sh</code></h3>
+
+<h4>List groups</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-consumer-groups.sh BS --list</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --list</code></pre></td></tr>
+<tr><th>Output</th><td><code>spring-crud</code></td></tr>
+</table>
+
+<h4>Describe a group (LAG &amp; offsets)</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-consumer-groups.sh BS --describe --group &lt;name&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group spring-crud</code></pre></td></tr>
+<tr><th>Output columns</th><td><code>GROUP / TOPIC / PARTITION / CURRENT-OFFSET / LOG-END-OFFSET / LAG / CONSUMER-ID / HOST / CLIENT-ID</code><br>
+<code>LAG</code> = LOG-END-OFFSET − CURRENT-OFFSET. Growing lag means the consumer is falling behind.</td></tr>
+</table>
+
+<h4>Reset offsets — replay or skip messages</h4>
+<table>
+<tr><th>Generic</th><td><pre><code>kafka-consumer-groups.sh BS --group &lt;name&gt; \
+  --reset-offsets --topic &lt;name&gt; --to-earliest|--to-latest|--to-offset N|--to-datetime ISO \
+  --execute</code></pre></td></tr>
+<tr><th>Project — replay all employee events</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group spring-crud --reset-offsets --topic employee.events \
+  --to-earliest --execute</code></pre></td></tr>
+<tr><th>Project — skip to latest (drop backlog)</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group spring-crud --reset-offsets --topic employee.events \
+  --to-latest --execute</code></pre></td></tr>
+<tr><th>Caveat</th><td>The consumer group must be <strong>stopped</strong> first (stop the Spring app), otherwise the command refuses with "Consumers are still active." Use <code>--dry-run</code> to preview without applying.</td></tr>
+</table>
+
+<h4>Delete a group</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-consumer-groups.sh BS --delete --group &lt;name&gt;</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --delete --group spring-crud</code></pre></td></tr>
+<tr><th>Caveat</th><td>Group must have no active members. Useful when you want a fresh start.</td></tr>
+</table>
+
+<h3>11.5 Configuration — <code>kafka-configs.sh</code></h3>
+
+<h4>Show non-default configs for a topic</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-configs.sh BS --entity-type topics --entity-name &lt;name&gt; --describe</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name employee.events --describe</code></pre></td></tr>
+<tr><th>Tip</th><td>Add <code>--all</code> to see EVERY config including broker defaults.</td></tr>
+</table>
+
+<h4>Alter a topic config (e.g. retention, compaction)</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-configs.sh BS --entity-type topics --entity-name &lt;name&gt; --alter --add-config &lt;k=v,...&gt;</code></td></tr>
+<tr><th>Project — 1-day retention</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name employee.events \
+  --alter --add-config retention.ms=86400000</code></pre></td></tr>
+<tr><th>Project — switch to compact</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name employee.events \
+  --alter --add-config cleanup.policy=compact</code></pre></td></tr>
+<tr><th>Revert a config (back to broker default)</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name employee.events \
+  --alter --delete-config retention.ms</code></pre></td></tr>
+</table>
+
+<h4>Show broker config (cluster-wide defaults)</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-configs.sh BS --entity-type brokers --entity-name &lt;broker-id&gt; --describe</code></td></tr>
+<tr><th>Project (broker id is <code>0</code> in single-node KRaft)</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-configs.sh \
+  --bootstrap-server localhost:9092 \
+  --entity-type brokers --entity-name 0 --describe</code></pre></td></tr>
+</table>
+
+<h3>11.6 Offsets &amp; partitions — <code>kafka-get-offsets.sh</code></h3>
+
+<table>
+<tr><th>Generic</th><td><code>kafka-get-offsets.sh BS --topic &lt;name&gt; --time -1|-2|&lt;ms&gt;</code><br>
+(<code>-1</code> = latest, <code>-2</code> = earliest, integer = ms since epoch)</td></tr>
+<tr><th>Project — latest offset per partition</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server localhost:9092 \
+  --topic employee.events --time -1</code></pre></td></tr>
+<tr><th>Output</th><td><code>employee.events:0:7</code> — partition 0 has 7 records (next message lands at offset 7).</td></tr>
+</table>
+
+<h3>11.7 Cluster info</h3>
+
+<h4>List broker IDs and metadata</h4>
+<table>
+<tr><th>Generic</th><td><code>kafka-broker-api-versions.sh BS</code></td></tr>
+<tr><th>Project</th><td><pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-broker-api-versions.sh \
+  --bootstrap-server localhost:9092</code></pre></td></tr>
+<tr><th>Use case</th><td>Verify the broker is reachable and which protocol versions it supports. Quick alternative to checking compose / docker logs.</td></tr>
+</table>
+
+<h3>11.8 Composing common dev workflows</h3>
+
+<h4>"Show me everything that's been published to the employee topic, key + headers"</h4>
+<pre><code>docker exec -it spring-crud-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic employee.events \
+  --from-beginning --max-messages 100 \
+  --property print.key=true \
+  --property print.headers=true \
+  --property key.separator=" | "</code></pre>
+
+<h4>"How far behind is my consumer?"</h4>
+<pre><code>docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --describe --group spring-crud</code></pre>
+<p>Look at the <code>LAG</code> column — anything &gt; 0 means messages are queued waiting to be consumed.</p>
+
+<h4>"Reset Spring's consumer to re-read every message from scratch"</h4>
+<pre><code># 1. Stop the Spring app first (consumer must be inactive):
+lsof -ti:8080 | xargs kill -9 2&gt;/dev/null
+
+# 2. Reset all of spring-crud's offsets to earliest on both topics:
+docker exec spring-crud-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 \
+  --group spring-crud --reset-offsets \
+  --topic employee.events --topic department.events \
+  --to-earliest --execute
+
+# 3. Restart the app:
+./gradlew bootRun</code></pre>
+
+<h4>"Wipe the broker and start fresh"</h4>
+<pre><code>docker compose down -v
+docker compose up -d</code></pre>
+<p>Removes all topics, all messages, all consumer-group offsets. The app will recreate topics on first publish.</p>
+
+<h2>12. What's left to cover</h2>
+<ul>
+  <li>Error handling: <code>DefaultErrorHandler</code> with retry + <code>DeadLetterPublishingRecoverer</code> → DLT topics for poison messages.</li>
+  <li>Transactions and exactly-once semantics (Kafka transactions + <code>KafkaTransactionManager</code>).</li>
+  <li>Schema Registry + Avro for typed contracts at scale.</li>
+  <li>Tests: <code>@EmbeddedKafka</code> for slice tests, Testcontainers for full integration.</li>
+  <li>Observability: producer/consumer metrics via Micrometer, lag alerts.</li>
+  <li>Kafka Streams for stateful stream processing.</li>
+</ul>
+
+</body>
+</html>
